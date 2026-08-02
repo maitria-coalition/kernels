@@ -1,0 +1,23 @@
+[package]
+name = "maitria-hypernet"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "The hypernet certificate genus: exact scalars, graph representation, and the canonical AXHN0001 byte format with its content digest — the org's one canonical decoder."
+
+[dependencies]
+# Exact arbitrary-precision arithmetic: the scalar leaves (WitInt /
+# WitRat) and the canonical rational encoding invent no values and
+# round nothing.
+num-bigint = "0.5"
+num-integer = "0.1"
+num-traits = "0.2"
+# Content digest over canonical bytes.
+sha2 = "0.11"
+# The scalar leaves' CBOR encoding rules (serde impls moved whole with
+# the types; normative schema doc: mtk CONTRACTS.md §2.1).
+serde = { version = "1", features = ["derive"] }
+ciborium = "0.2.2"
+serde_bytes = "0.11"
+thiserror = "2"
+

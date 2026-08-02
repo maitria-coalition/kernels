@@ -1,0 +1,19 @@
+# kernels workspace.
+#
+# Members arrive by deliberate re-authoring (see README, *Status*, and
+# STATUS.md). The planned topology: the core crate is zero-dependency
+# CPU lanes; GPU lanes join as sibling crates (optional-plugin posture
+# — a consumer that wants only CPU lanes never compiles a GPU
+# toolchain), each uncommented when its crate lands.
+
+[workspace]
+resolver = "2"
+members = [
+    "crates/maitria-kernels",
+    "crates/maitria-kernels-cuda",
+    "crates/maitria-hypernet",
+]
+
+[workspace.package]
+edition = "2021"
+license = "MIT OR Apache-2.0"

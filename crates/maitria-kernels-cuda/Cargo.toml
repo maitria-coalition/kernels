@@ -1,0 +1,32 @@
+[package]
+name = "maitria-kernels-cuda"
+description = "NVIDIA GPU lanes for the maitria-kernels families (raw CUDA via cudarc, NVRTC pipeline): conformance-gated device implementations whose verdicts must be bit-identical to the core crate's scalar references. Never a trusted computing base."
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+# The rayon feature parallelizes the core crate's channel planning —
+# cost-only, output-identical (its differential rides the core
+# battery); this crate's own host-side residue tables parallelize the
+# same way below.
+maitria-kernels = { path = "../maitria-kernels", features = ["rayon"] }
+rayon = "1.12"
+# Raw CUDA driver + NVRTC bindings — the house GPU path (CUDA-not-
+# candle). Pipeline-of-record note: NVRTC + driver JIT; the
+# disassembly branch-count acceptance item (ENGINEERING #6) rides the
+# receipts, and an offline nvcc→cubin path can join later without
+# changing callers.
+cudarc = { version = "0.19.8", default-features = false, features = [
+    "driver",
+    "nvrtc",
+    "std",
+    "dynamic-loading",
+    "cuda-12080",
+] }
+thiserror = "2"
+
+[dev-dependencies]
+proptest = "1"
+num-bigint = "0.5"
+num-traits = "0.2"

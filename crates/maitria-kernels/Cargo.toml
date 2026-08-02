@@ -1,0 +1,31 @@
+[package]
+name = "maitria-kernels"
+description = "Shared multi-architecture fast paths for a certificate-checked verification system: reference-first CPU kernels (scalar + NEON + AVX2) under a verdict-identity conformance discipline. Producer-and-consumer shared computational structures only; never a trusted computing base."
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+
+# Zero runtime dependencies BY DEFAULT, deliberately: the reference
+# floor and the CPU lanes are std-only, so the whole verdict-relevant
+# surface is auditable without a dependency tree. The one optional
+# feature below parallelizes host-side *planning* walks (identical
+# results — max-reductions over the same data, associative and
+# commutative); consumers that want it opt in, and the default build
+# stays dependency-free.
+[dependencies]
+rayon = { version = "1.12", optional = true }
+
+[features]
+# Parallel channel planning (rnsfold::RnsFoldBatch::plan_channels).
+# Cost-only: verdict-relevant outputs are bit-identical with the
+# feature on or off, and the conformance battery runs both ways in CI
+# (the lane law applied to a host walk).
+rayon = ["dep:rayon"]
+
+[dev-dependencies]
+proptest = "1"
+# Battery-only: the independent big-integer partner for the rnsfold
+# family (the direct Δ = 0 formulation, no residues anywhere). Never a
+# runtime dependency — the zero-dep stance above governs shipping code.
+num-bigint = "0.5"
+num-traits = "0.2"

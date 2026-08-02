@@ -1,0 +1,25 @@
+{
+  "fixtures": {
+    "g1_identity": {
+      "n_apps": 0,
+      "n_bytes": 68,
+      "sha256": "4b023c84a430604ad955c772467e50619dc167f398b9cb2f206457a6580da553"
+    },
+    "g2_allprims": {
+      "n_apps": 11,
+      "n_bytes": 616,
+      "sha256": "7803d7de54aa778768ef2ad7d9e7dc819a528be2ddafb6202004a0041f3b69ad"
+    },
+    "g3_cartpole_drift": {
+      "n_apps": 15,
+      "n_bytes": 752,
+      "sha256": "69b6f4c62e02563615ae19c00fa957351a9be4f0c4d8374d37494e072176db02"
+    },
+    "g4_subst_composite": {
+      "n_apps": 4,
+      "n_bytes": 248,
+      "sha256": "1bd92c3d661a5eb04f8c7b1fe23480391acfed54e858dd38cd45694febb93c16"
+    }
+  },
+  "generator": "gen_goldens.py (X0 reference impl)"
+}
