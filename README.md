@@ -7,8 +7,8 @@ verification system build and evaluate, implemented once, per
 architecture, behind one conformance discipline.
 
 The system's trust architecture (see the
-[`geolog-alpha`](https://github.com/maitria-coalition/geolog-alpha)
-README and the [`qtsl`](https://github.com/maitria-coalition/qtsl)
+`geolog-alpha`
+README and the `qtsl`
 repository) splits the world into
 untrusted producers and a small verified checking surface. Between
 them sits a large body of computation that is neither: Bernstein-basis
@@ -100,7 +100,7 @@ which no separate certified checker re-derives the result. The defenses
 are scalar or exact references, property-based differential batteries,
 typed deferral to exact arithmetic, exact confirmation where the API
 provides it, deterministic pipelines, and committed hardware receipts.
-The [`qtsl`](https://github.com/maitria-coalition/qtsl) checkers add a
+The `qtsl` checkers add a
 further boundary only for the fragments they actually re-check.
 
 ## Shipped components
@@ -137,10 +137,10 @@ conformance runs, and timing measurements behind dispatch choices.
 
 This repository is one of six:
 
-- **[geolog-alpha](https://github.com/maitria-coalition/geolog-alpha)** —
+- **geolog-alpha** (not yet published) —
   a local-first database whose tables are logical consequences; consumes
   these lanes behind its acceleration feature flags.
-- **[qtsl](https://github.com/maitria-coalition/qtsl)** — the
+- **qtsl** (not yet published) — the
   Quantitative Temporal Specification Logic: theories, rule catalogue,
   mechanized soundness developments, certified checkers, fixtures, and
   the book.

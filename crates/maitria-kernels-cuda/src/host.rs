@@ -27,7 +27,10 @@
 //! item must read the PTX this pipeline actually emitted, not an
 //! offline-nvcc proxy.
 
-use cudarc::driver::{CudaContext, CudaModule, CudaSlice, CudaStream, DeviceRepr, LaunchConfig};
+use cudarc::driver::{
+    result, CudaContext, CudaEvent, CudaModule, CudaSlice, CudaStream, DevicePtrMut, DeviceRepr,
+    LaunchConfig,
+};
 use cudarc::nvrtc::{compile_ptx_with_opts, CompileOptions, Ptx};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -224,6 +227,235 @@ pub fn htod_nonempty<T: DeviceRepr + Default>(
         stream.clone_htod(&[T::default()])
     } else {
         stream.clone_htod(v)
+    }
+}
+
+// ---- pinned-host staging (the upload-wall lever) ----
+
+/// Below this many bytes a "staged" upload delegates to the direct
+/// pageable path: the staging turn's fixed costs (an event wait, a
+/// separate DMA issue) exceed the pageable copy of a small plane, and
+/// the delegation keeps zero-length semantics byte-for-byte identical
+/// to `CudaStream::clone_htod`.
+pub const STAGE_BYPASS_BYTES: usize = 64 << 10;
+
+/// Double-buffered page-locked staging for host→device uploads.
+///
+/// The lane's phase receipts measured the rnsfold device lane
+/// *upload-dominated*: pageable H2D ran at ~8–9 GB/s while the bus
+/// could carry several times that from pinned memory, and the driver's
+/// internal pageable staging serializes against the CPU. This stager
+/// owns two page-locked buffers and rotates them: while the DMA out of
+/// one buffer is in flight, the CPU fills the other (a parallel memcpy
+/// — the buffers are write-combined, which is exactly right for
+/// streaming stores that are never read back). Each buffer's CUDA
+/// event guards its reuse; the rotation persists across planes, so the
+/// last chunk of one plane overlaps the first fill of the next.
+///
+/// Cost, never verdicts (lane law, repository `README.md`): the staged
+/// path moves exactly the caller's elements — a typed memcpy into the
+/// pinned buffer, then an async DMA of those same elements — and
+/// `tests/staging.rs` gates round-trip byte-identity plus the
+/// engagement witness ([`Self::staged_chunks`]).
+pub struct PinnedStager {
+    bufs: [cudarc::driver::PinnedHostSlice<u8>; 2],
+    events: [CudaEvent; 2],
+    turn: usize,
+    chunk: usize,
+    staged_chunks: u64,
+}
+
+impl PinnedStager {
+    /// Default per-buffer size: 32 MiB — ~20 turns at the X1-batch
+    /// plane volume, small enough that two of them are noise against a
+    /// GPU box's host RAM.
+    pub const DEFAULT_CHUNK: usize = 32 << 20;
+
+    /// Allocate the staging pair on `ctx`. `chunk` is the per-buffer
+    /// byte size, rounded up to a 4 KiB multiple (so every lane
+    /// element type divides it).
+    pub fn new(ctx: &Arc<CudaContext>, chunk: usize) -> Result<Self, cudarc::driver::DriverError> {
+        let chunk = chunk.next_multiple_of(4096).max(4096);
+        // SAFETY: the buffers are uninitialized here; every read of
+        // buffer bytes happens only after the staging loop has written
+        // exactly those bytes (each turn fills `[..n]` then uploads
+        // `[..n]`).
+        let bufs = [unsafe { ctx.alloc_pinned::<u8>(chunk) }?, unsafe {
+            ctx.alloc_pinned::<u8>(chunk)
+        }?];
+        let events = [ctx.new_event(None)?, ctx.new_event(None)?];
+        Ok(Self {
+            bufs,
+            events,
+            turn: 0,
+            chunk,
+            staged_chunks: 0,
+        })
+    }
+
+    /// [`Self::new`] with the chunk size from
+    /// `MAITRIA_KERNELS_STAGE_CHUNK` (bytes; unset or unparsable ⇒
+    /// [`Self::DEFAULT_CHUNK`]) — the receipts' tuning knob.
+    pub fn from_env(ctx: &Arc<CudaContext>) -> Result<Self, cudarc::driver::DriverError> {
+        let chunk = std::env::var("MAITRIA_KERNELS_STAGE_CHUNK")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(Self::DEFAULT_CHUNK);
+        Self::new(ctx, chunk)
+    }
+
+    /// How many chunks have gone through the staged path — the
+    /// engagement witness for the battery (a stager that silently
+    /// delegated everything would report 0 and fail the test).
+    pub fn staged_chunks(&self) -> u64 {
+        self.staged_chunks
+    }
+
+    /// Upload a host slice to a fresh device buffer through the
+    /// staging pair. Small and empty slices delegate to
+    /// `CudaStream::clone_htod` ([`STAGE_BYPASS_BYTES`]).
+    pub fn clone_htod<T: DeviceRepr + Copy + Send + Sync>(
+        &mut self,
+        stream: &Arc<CudaStream>,
+        src: &[T],
+    ) -> Result<CudaSlice<T>, cudarc::driver::DriverError> {
+        if std::mem::size_of_val(src) <= STAGE_BYPASS_BYTES {
+            return stream.clone_htod(src);
+        }
+        // SAFETY: uninitialized allocation; the staging loop below
+        // writes every element before anything reads the buffer.
+        let mut dst = unsafe { stream.alloc::<T>(src.len()) }?;
+        self.stage_into(stream, src, &mut dst)?;
+        Ok(dst)
+    }
+
+    /// [`htod_nonempty`], staged: the empty case pads to one zeroed
+    /// element exactly as the direct helper does.
+    pub fn htod_nonempty<T: DeviceRepr + Copy + Send + Sync + Default>(
+        &mut self,
+        stream: &Arc<CudaStream>,
+        v: &[T],
+    ) -> Result<CudaSlice<T>, cudarc::driver::DriverError> {
+        if v.is_empty() {
+            stream.clone_htod(&[T::default()])
+        } else {
+            self.clone_htod(stream, v)
+        }
+    }
+
+    fn stage_into<T: DeviceRepr + Copy + Send + Sync>(
+        &mut self,
+        stream: &Arc<CudaStream>,
+        src: &[T],
+        dst: &mut CudaSlice<T>,
+    ) -> Result<(), cudarc::driver::DriverError> {
+        stream.context().bind_to_thread()?;
+        let (dst_ptr, _record_dst) = dst.device_ptr_mut(stream);
+        let chunk_elems = self.chunk / std::mem::size_of::<T>();
+        debug_assert!(chunk_elems > 0);
+        let mut off = 0usize;
+        while off < src.len() {
+            let n = chunk_elems.min(src.len() - off);
+            let i = self.turn & 1;
+            self.turn += 1;
+            // CPU-side wait: the previous DMA out of buffer `i` must
+            // have drained before its bytes are overwritten.
+            self.events[i].synchronize()?;
+            {
+                // SAFETY: the pinned allocation is page-aligned (so
+                // aligned for any lane element type) and `n * size_of
+                // ::<T>() <= chunk` by construction; the embedded
+                // event wait in `as_mut_ptr` is a no-op (that event is
+                // never recorded on this path — `events[i]` above is
+                // the guard).
+                let stage: &mut [T] = unsafe {
+                    std::slice::from_raw_parts_mut(self.bufs[i].as_mut_ptr()? as *mut T, n)
+                };
+                par_fill(stage, &src[off..off + n]);
+                // SAFETY: `dst` was allocated with `src.len()` elements
+                // and `off + n <= src.len()`, so the destination range
+                // is in bounds; `stage` is page-locked, so the async
+                // copy reads it at bus rate and `events[i]` (recorded
+                // below) guards its reuse.
+                unsafe {
+                    result::memcpy_htod_async(
+                        dst_ptr + (off * std::mem::size_of::<T>()) as u64,
+                        &stage[..n],
+                        stream.cu_stream(),
+                    )
+                }?;
+            }
+            self.events[i].record(stream)?;
+            self.staged_chunks += 1;
+            off += n;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for PinnedStager {
+    fn drop(&mut self) {
+        // A pinned buffer freed while a DMA still reads from it would
+        // be undefined behavior; drain both guard events first (errors
+        // ignored — there is nothing further to do at drop).
+        for e in &self.events {
+            let _ = e.synchronize();
+        }
+    }
+}
+
+/// Parallel memcpy for staging fills: sequential streaming stores per
+/// rayon grain — the access pattern write-combined memory wants.
+fn par_fill<T: Copy + Send + Sync>(dst: &mut [T], src: &[T]) {
+    use rayon::prelude::*;
+    const PAR_MIN_BYTES: usize = 4 << 20;
+    const GRAIN_BYTES: usize = 2 << 20;
+    debug_assert_eq!(dst.len(), src.len());
+    if std::mem::size_of_val(src) < PAR_MIN_BYTES {
+        dst.copy_from_slice(src);
+    } else {
+        let grain = (GRAIN_BYTES / std::mem::size_of::<T>()).max(1);
+        dst.par_chunks_mut(grain)
+            .zip(src.par_chunks(grain))
+            .for_each(|(d, s)| d.copy_from_slice(s));
+    }
+}
+
+/// Upload-path selector a lane threads through its plane uploads:
+/// direct pageable (`CudaStream::clone_htod` — the pre-staging path,
+/// kept selectable via `MAITRIA_KERNELS_PAGEABLE` for A/B receipts) or
+/// pinned staging. Selection is cost-only; both paths move identical
+/// bytes.
+pub enum Uploader<'a> {
+    /// Direct `clone_htod` from pageable memory.
+    Pageable,
+    /// Staged through a [`PinnedStager`].
+    Pinned(&'a mut PinnedStager),
+}
+
+impl Uploader<'_> {
+    /// Upload a (non-empty-semantics-preserving) host slice.
+    pub fn clone_htod<T: DeviceRepr + Copy + Send + Sync>(
+        &mut self,
+        stream: &Arc<CudaStream>,
+        v: &[T],
+    ) -> Result<CudaSlice<T>, cudarc::driver::DriverError> {
+        match self {
+            Uploader::Pageable => stream.clone_htod(v),
+            Uploader::Pinned(s) => s.clone_htod(stream, v),
+        }
+    }
+
+    /// Upload with the zero-length pad ([`htod_nonempty`]).
+    pub fn htod_nonempty<T: DeviceRepr + Copy + Send + Sync + Default>(
+        &mut self,
+        stream: &Arc<CudaStream>,
+        v: &[T],
+    ) -> Result<CudaSlice<T>, cudarc::driver::DriverError> {
+        match self {
+            Uploader::Pageable => htod_nonempty(stream, v),
+            Uploader::Pinned(s) => s.htod_nonempty(stream, v),
+        }
     }
 }
 

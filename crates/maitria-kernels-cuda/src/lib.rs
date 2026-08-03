@@ -25,7 +25,7 @@
 pub mod host;
 
 use cudarc::driver::{CudaFunction, LaunchConfig, PushKernelArg};
-use host::{htod_nonempty, CompileSpec, CudaHost, HostError};
+use host::{htod_nonempty, CompileSpec, CudaHost, HostError, PinnedStager, Uploader};
 use maitria_kernels::rnsfold::batch::{BatchError, RnsFoldBatch, RnsFoldOutcome};
 use maitria_kernels::rnsfold::primes::{residue_of_limbs, residue_signed, PRIMES};
 use maitria_kernels::roweq::batch::{RowEqBatch, RowEqError, RowEqOutcome};
@@ -91,6 +91,10 @@ fn to_mont(x: u64, p: u64) -> u64 {
 pub struct RnsFoldGpu {
     host: CudaHost,
     func: CudaFunction,
+    /// Reusable pinned staging pair for plane uploads (the
+    /// upload lever; see [`host::PinnedStager`]). Behind a mutex only
+    /// because `verify` takes `&self`; contention is per-lane-object.
+    stager: std::sync::Mutex<PinnedStager>,
     /// (major, minor) compute capability of the bound device.
     pub cc: (i32, i32),
 }
@@ -110,7 +114,13 @@ impl RnsFoldGpu {
             .compile("rnsfold", RNSFOLD_CU, &spec)?
             .load_function("rnsfold_fold")?;
         let cc = host.cc;
-        Ok(Self { host, func, cc })
+        let stager = std::sync::Mutex::new(PinnedStager::from_env(&host.ctx)?);
+        Ok(Self {
+            host,
+            func,
+            stager,
+            cc,
+        })
     }
 
     /// One line of device identification for receipts.
@@ -129,6 +139,13 @@ impl RnsFoldGpu {
     /// grain): per-entry results are independent and the arithmetic is
     /// unchanged, so the tables are bit-identical to the serial
     /// spelling's — cost, never verdicts.
+    ///
+    /// Plane uploads ride double-buffered pinned staging by default
+    /// ([`host::PinnedStager`] — the upload-wall lever; knobs:
+    /// `MAITRIA_KERNELS_PAGEABLE` restores the direct pageable path
+    /// for A/B receipts, `MAITRIA_KERNELS_STAGE_CHUNK` sets the
+    /// staging buffer size in bytes). Same bytes either way — cost,
+    /// never verdicts.
     pub fn verify(&self, b: &RnsFoldBatch) -> Result<RnsFoldOutcome, GpuError> {
         use rayon::prelude::*;
         let phase_log = std::env::var_os("MAITRIA_KERNELS_PHASE_LOG").is_some();
@@ -202,22 +219,35 @@ impl RnsFoldGpu {
         let t_tables = t.elapsed();
 
         // ---- upload ----
+        // Pinned staging by default (the upload-wall lever);
+        // `MAITRIA_KERNELS_PAGEABLE` selects the direct pageable path
+        // for A/B receipts. Both paths move identical bytes — cost,
+        // never verdicts. Phase-wall note: staged DMAs are truly
+        // async, so `upload` measures fill+issue and the DMA tail of
+        // the final chunks lands in `launch+sync` — compare the SUM of
+        // the two walls across modes, not `upload` alone.
         let t = std::time::Instant::now();
         let st = &self.host.stream;
-        let d_primes = st.clone_htod(&ps)?;
-        let d_pinvs = st.clone_htod(&pinvs)?;
-        let d_powr2 = st.clone_htod(&powr2)?;
-        let d_lamres = st.clone_htod(&lamres)?;
-        let d_multres = st.clone_htod(&multres)?;
-        let d_sign = st.clone_htod(&sign_i32)?;
-        let d_mag = st.clone_htod(&b.mag)?;
-        let d_multid = st.clone_htod(&b.mult_id)?;
-        let d_acolat = st.clone_htod(&acol_attempt)?;
-        let d_cscptr = st.clone_htod(&b.csc_ptr)?;
+        let mut stager = self.stager.lock().unwrap();
+        let mut up = if std::env::var_os("MAITRIA_KERNELS_PAGEABLE").is_some() {
+            Uploader::Pageable
+        } else {
+            Uploader::Pinned(&mut stager)
+        };
+        let d_primes = up.clone_htod(st, &ps)?;
+        let d_pinvs = up.clone_htod(st, &pinvs)?;
+        let d_powr2 = up.clone_htod(st, &powr2)?;
+        let d_lamres = up.clone_htod(st, &lamres)?;
+        let d_multres = up.clone_htod(st, &multres)?;
+        let d_sign = up.clone_htod(st, &sign_i32)?;
+        let d_mag = up.clone_htod(st, &b.mag)?;
+        let d_multid = up.clone_htod(st, &b.mult_id)?;
+        let d_acolat = up.clone_htod(st, &acol_attempt)?;
+        let d_cscptr = up.clone_htod(st, &b.csc_ptr)?;
         // nnz planes may be empty; keep cudarc away from zero-length allocs.
-        let d_csclam = htod_nonempty(st, &b.csc_lam)?;
-        let d_cscslot = htod_nonempty(st, &b.csc_slot)?;
-        let d_concl = st.clone_htod(&b.concl_slot)?;
+        let d_csclam = up.htod_nonempty(st, &b.csc_lam)?;
+        let d_cscslot = up.htod_nonempty(st, &b.csc_slot)?;
+        let d_concl = up.clone_htod(st, &b.concl_slot)?;
         let mut d_flags = st.alloc_zeros::<u32>(n_attempts)?;
 
         let t_upload = t.elapsed();

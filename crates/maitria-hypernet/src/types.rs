@@ -121,7 +121,7 @@ impl std::fmt::Display for Dtype {
             Kind::Bool => Sign::NonNeg,
             _ => Sign::Signed,
         };
-        let sign = (self.sign != conventional_sign).then(|| match self.sign {
+        let sign = (self.sign != conventional_sign).then_some(match self.sign {
             Sign::NonNeg => "nonneg",
             Sign::Signed => "signed",
         });
