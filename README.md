@@ -137,10 +137,10 @@ conformance runs, and timing measurements behind dispatch choices.
 
 This repository is one of six:
 
-- **geolog-alpha** (not yet published) —
+- **[geolog-alpha](https://github.com/maitria-coalition/geolog-alpha)** —
   a local-first database whose tables are logical consequences; consumes
   these lanes behind its acceleration feature flags.
-- **qtsl** (not yet published) — the
+- **[qtsl](https://github.com/maitria-coalition/qtsl)** — the
   Quantitative Temporal Specification Logic: theories, rule catalogue,
   mechanized soundness developments, certified checkers, fixtures, and
   the book.
